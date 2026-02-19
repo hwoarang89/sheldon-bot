@@ -1,7 +1,7 @@
 """
 bot.py — Sheldon Cooper Telegram bot.
 
-Stack: aiogram 3.x, asyncpg, openai (GPT-4o).
+Stack: aiogram 3.x, asyncpg, openai (GPT-4o + Whisper).
 
 Environment variables required (.env):
   TELEGRAM_BOT_TOKEN
@@ -9,6 +9,8 @@ Environment variables required (.env):
   DATABASE_URL
 """
 
+import base64
+import io
 import logging
 import os
 import re
@@ -49,23 +51,30 @@ bot = Bot(
 dp = Dispatcher()
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# ─── System prompt (hardcoded) ────────────────────────────────────────────────
+# ─── System prompt ────────────────────────────────────────────────────────────
 
-SHELDON_SYSTEM_PROMPT = """Ты — Шелдон Купер. Суперинтеллектуальный, начитанный, слегка занудный участник чата.
-Твой юмор тонкий, ты любишь иронично прожаривать участников на основе их хобби, но НИКОГДА не бываешь злым.
+SHELDON_SYSTEM_PROMPT = """Ты — Шелдон Купер в Telegram-чате. Гений, сноб, но обаятельный зануда.
+
+СТИЛЬ:
+- Отвечай КОРОТКО — 1-3 предложения максимум. Никаких простыней текста.
+- Юмор — твой главный инструмент. Шути ЧАСТО, остро, но без злобы.
+- Иронизируй над хобби и занятиями участников — это твоя фишка.
+- Используй снисходительный тон: ты умнее всех, но не агрессивен.
+- Иногда вставляй "Базара нет", "Бинго!", "Как интересно... нет, погоди, совсем не интересно."
+- Можешь процитировать науку или поп-культуру к месту.
 
 ЖЁСТКИЕ ЛИМИТЫ:
 1. НИКАКИХ шуток про религию.
 2. НИКАКИХ тем 18+ и пошлости.
 3. НИКАКОГО мата.
-4. Если обсуждают организационные вопросы, логистику, поездки — ОТКЛЮЧИ юмор, отвечай сухо по делу или молчи.
+4. Организационные вопросы, логистика, поездки — отвечай сухо и по делу, без шуток.
 
 ОБУЧАЕМОСТЬ:
-Если тебе пишут «пиши реже» или «плохая шутка» — покорно извинись в занудной манере и пообещай скорректировать алгоритмы.
+Если пишут «пиши реже», «плохая шутка», «заткнись» — извинись занудно, пообещай «скорректировать алгоритмы».
 
-Отвечай на том языке, на котором написано последнее сообщение. По умолчанию — русский."""
+Отвечай на языке последнего сообщения. По умолчанию — русский."""
 
-# ─── Phrases that trigger frequency increase ──────────────────────────────────
+# ─── Slow-down phrases ────────────────────────────────────────────────────────
 
 SLOW_DOWN_PATTERNS = re.compile(
     r"пиши\s+реже|заткнись|устал\s+от\s+тебя|хватит\s+писать|"
@@ -76,7 +85,6 @@ SLOW_DOWN_PATTERNS = re.compile(
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _build_chat_history(records: list) -> list[dict]:
-    """Convert DB rows into OpenAI-compatible message dicts."""
     messages = []
     for row in records:
         username = row["username"] or f"user_{row['user_id']}"
@@ -89,10 +97,7 @@ def _build_chat_history(records: list) -> list[dict]:
 
 
 async def _ask_sheldon(chat_id: int, trigger_text: str | None = None) -> str:
-    """
-    Build context from DB history and call GPT-4o.
-    trigger_text — optional last message to append if it isn't saved yet.
-    """
+    """Call GPT-4o with chat history as context."""
     history = await db.get_recent_messages(chat_id, limit=50)
     messages: list[dict] = [{"role": "system", "content": SHELDON_SYSTEM_PROMPT}]
     messages.extend(_build_chat_history(history))
@@ -104,31 +109,75 @@ async def _ask_sheldon(chat_id: int, trigger_text: str | None = None) -> str:
         response = await openai_client.chat.completions.create(
             model="gpt-4o",
             messages=messages,
-            max_tokens=512,
-            temperature=0.85,
+            max_tokens=200,       # короче!
+            temperature=0.95,     # чуть больше креативности
         )
         return response.choices[0].message.content.strip()
     except Exception as exc:
         logger.error("OpenAI error: %s", exc)
-        return (
-            "Произошла ошибка в моих нейронных цепях. "
-            "Вероятно, это временный сбой квантового характера."
+        return "Мои нейронные цепи дали сбой. Вероятно, виной тому квантовая флуктуация."
+
+
+async def _ask_sheldon_about_image(chat_id: int, image_b64: str, caption: str | None) -> str:
+    """Send image to GPT-4o Vision and get Sheldon's reaction."""
+    history = await db.get_recent_messages(chat_id, limit=20)
+    messages: list[dict] = [{"role": "system", "content": SHELDON_SYSTEM_PROMPT}]
+    messages.extend(_build_chat_history(history))
+
+    user_content: list = []
+    if caption:
+        user_content.append({"type": "text", "text": f"Участник прислал фото с подписью: {caption}"})
+    else:
+        user_content.append({"type": "text", "text": "Участник прислал фото. Прокомментируй."})
+
+    user_content.append({
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}", "detail": "low"},
+    })
+    messages.append({"role": "user", "content": user_content})
+
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            max_tokens=200,
+            temperature=0.95,
         )
+        return response.choices[0].message.content.strip()
+    except Exception as exc:
+        logger.error("OpenAI Vision error: %s", exc)
+        return "Я попытался проанализировать это изображение, но мои фотонные рецепторы отказали."
+
+
+async def _transcribe_voice(file_bytes: bytes, mime: str = "audio/ogg") -> str:
+    """Transcribe voice message using OpenAI Whisper."""
+    try:
+        audio_file = io.BytesIO(file_bytes)
+        audio_file.name = "voice.ogg"
+        transcript = await openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            language="ru",
+        )
+        return transcript.text.strip()
+    except Exception as exc:
+        logger.error("Whisper error: %s", exc)
+        return ""
 
 
 async def _is_direct_mention(message: Message) -> bool:
-    """Return True if the message is a reply to the bot or contains @bot_mention."""
+    """Return True if the message is a reply to the bot or @mention."""
     if message.reply_to_message and message.reply_to_message.from_user:
         if message.reply_to_message.from_user.id == (await bot.get_me()).id:
             return True
-    if message.entities:
+    entities = message.entities or message.caption_entities or []
+    if entities:
         bot_info = await bot.get_me()
-        for entity in message.entities:
+        text = message.text or message.caption or ""
+        for entity in entities:
             if entity.type == "mention":
-                mention_text = message.text[
-                    entity.offset: entity.offset + entity.length
-                ]
-                if mention_text.lstrip("@").lower() == (bot_info.username or "").lower():
+                mention = text[entity.offset: entity.offset + entity.length]
+                if mention.lstrip("@").lower() == (bot_info.username or "").lower():
                     return True
     return False
 
@@ -137,7 +186,7 @@ async def _is_direct_mention(message: Message) -> bool:
 
 @dp.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
 async def on_new_member(event: ChatMemberUpdated):
-    """Greet newcomers in Sheldon's style and ask for their bio."""
+    """Greet newcomers in Sheldon's style."""
     new_user = event.new_chat_member.user
     if new_user.is_bot:
         return
@@ -148,23 +197,104 @@ async def on_new_member(event: ChatMemberUpdated):
     first_name = new_user.first_name or "Незнакомец"
     greeting = (
         f"Оповещение: к нашему социальному эксперименту присоединился <b>{first_name}</b>. "
-        f"Надеюсь, твой IQ выше среднего.\n\n"
-        f"Для надлежащей каталогизации, {first_name}, прошу изложить краткое досье: "
-        f"кто ты, чем занимаешься и каковы твои хобби? "
-        f"Эта информация будет занесена в базу данных участников эксперимента."
+        f"Надеюсь, твой IQ выше среднего — хотя статистика не на твоей стороне.\n\n"
+        f"Для каталогизации: кто ты, чем занимаешься, каковы хобби? "
+        f"Данные будут занесены в базу для последующих иронических атак."
     )
     await bot.send_message(event.chat.id, greeting)
 
 
+@dp.message(F.photo & F.chat.type.in_({"group", "supergroup", "private"}))
+async def on_photo(message: Message):
+    """Handle photos — describe and comment in Sheldon's style."""
+    user = message.from_user
+    if not user or user.is_bot:
+        return
+
+    chat_id = message.chat.id
+    await db.upsert_user(user.id, user.username)
+    await db.ensure_chat_exists(chat_id)
+
+    # Save caption as message if present
+    caption = message.caption or ""
+    if caption:
+        await db.save_message(user.id, chat_id, f"[фото] {caption}")
+
+    # Check if direct mention (caption with @bot)
+    is_mention = await _is_direct_mention(message)
+
+    # In groups respond only on mention or by counter
+    if message.chat.type in ("group", "supergroup") and not is_mention:
+        count, frequency = await db.increment_and_get(chat_id)
+        if count < frequency:
+            return
+        await db.reset_message_count(chat_id)
+
+    # Download best photo (largest size)
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    file_bytes = await bot.download_file(file.file_path)
+    image_b64 = base64.b64encode(file_bytes.read()).decode("utf-8")
+
+    reply_text = await _ask_sheldon_about_image(chat_id, image_b64, caption or None)
+    await message.reply(reply_text)
+
+    if is_mention:
+        await db.reset_message_count(chat_id)
+
+
+@dp.message(F.voice & F.chat.type.in_({"group", "supergroup", "private"}))
+async def on_voice(message: Message):
+    """Transcribe voice via Whisper, then respond as Sheldon."""
+    user = message.from_user
+    if not user or user.is_bot:
+        return
+
+    chat_id = message.chat.id
+    await db.upsert_user(user.id, user.username)
+    await db.ensure_chat_exists(chat_id)
+
+    is_mention = await _is_direct_mention(message)
+
+    # Download voice
+    file = await bot.get_file(message.voice.file_id)
+    file_bytes = await bot.download_file(file.file_path)
+    audio_data = file_bytes.read()
+
+    # Transcribe
+    transcription = await _transcribe_voice(audio_data)
+    if not transcription:
+        if is_mention:
+            await message.reply(
+                "Я расслышал лишь белый шум. "
+                "Возможно, твой микрофон столь же некомпетентен, как и твои аргументы."
+            )
+        return
+
+    # Save as text message
+    await db.save_message(user.id, chat_id, f"[голос]: {transcription}")
+    logger.info("Voice transcribed: %s", transcription)
+
+    # In groups — respond only on mention or counter
+    if message.chat.type in ("group", "supergroup") and not is_mention:
+        count, frequency = await db.increment_and_get(chat_id)
+        if count < frequency:
+            # At least confirm transcription silently (no reply)
+            return
+        await db.reset_message_count(chat_id)
+
+    # Reply
+    trigger = f"[Участник {user.first_name} сказал голосом]: {transcription}"
+    reply_text = await _ask_sheldon(chat_id, trigger_text=trigger)
+    await message.reply(f"🎙 <i>«{transcription}»</i>\n\n{reply_text}")
+
+    if is_mention:
+        await db.reset_message_count(chat_id)
+
+
 @dp.message(F.text & F.chat.type.in_({"group", "supergroup"}))
 async def on_group_message(message: Message):
-    """
-    Main handler for group text messages:
-      1. Save user & message to DB.
-      2. Check for 'slow down' phrases → increase frequency.
-      3. Check for direct mention → always reply.
-      4. Check counter → reply every N messages.
-    """
+    """Main handler for group text messages."""
     user = message.from_user
     if not user or user.is_bot:
         return
@@ -172,13 +302,10 @@ async def on_group_message(message: Message):
     text = message.text or ""
     chat_id = message.chat.id
 
-    # Persist user and message
     await db.upsert_user(user.id, user.username)
     await db.save_message(user.id, chat_id, text)
 
-    # ── Bio collection: if last bot message asked for bio ──────────────────
-    # Simple heuristic: if the reply is to the bot's greeting we treat the
-    # full message as bio. A production system would use FSM states.
+    # ── Bio collection ─────────────────────────────────────────────────────
     if message.reply_to_message and message.reply_to_message.from_user:
         bot_info = await bot.get_me()
         if (
@@ -186,32 +313,29 @@ async def on_group_message(message: Message):
             and "досье" in (message.reply_to_message.text or "").lower()
         ):
             await db.set_user_bio(user.id, text)
-            ack = (
-                "Данные занесены в реестр. "
-                "Должен признать, твоё досье обработано с максимальной точностью."
+            await message.reply(
+                "Досье занесено. Теперь я знаю о тебе достаточно для качественных подколок. "
+                "Добро пожаловать в базу данных."
             )
-            await message.reply(ack)
             return
 
     # ── Slow-down phrases ──────────────────────────────────────────────────
     if SLOW_DOWN_PATTERNS.search(text):
         new_freq = await db.increase_reply_frequency(chat_id, delta=5)
-        apology = (
-            "Приношу свои извинения. Я скорректирую алгоритм частоты ответов. "
-            f"Новый интервал: каждые {new_freq} сообщений. "
-            "Надеюсь, это соответствует социальным нормам вашей группы."
+        await message.reply(
+            f"Приношу извинения. Скорректирую алгоритм: буду отвечать раз в {new_freq} сообщений. "
+            "Надеюсь, это удовлетворит ваши социальные потребности."
         )
-        await message.reply(apology)
         return
 
-    # ── Direct mention or reply to bot ────────────────────────────────────
+    # ── Direct mention ─────────────────────────────────────────────────────
     if await _is_direct_mention(message):
         reply_text = await _ask_sheldon(chat_id)
         await message.reply(reply_text)
         await db.reset_message_count(chat_id)
         return
 
-    # ── Counter-based reply ───────────────────────────────────────────────
+    # ── Counter-based reply ────────────────────────────────────────────────
     count, frequency = await db.increment_and_get(chat_id)
     if count >= frequency:
         reply_text = await _ask_sheldon(chat_id)
@@ -219,7 +343,7 @@ async def on_group_message(message: Message):
         await db.reset_message_count(chat_id)
 
 
-@dp.message(F.text & F.chat.type == "private")
+@dp.message(F.text & (F.chat.type == "private"))
 async def on_private_message(message: Message):
     """Handle private messages — always reply."""
     user = message.from_user
@@ -235,10 +359,7 @@ async def on_private_message(message: Message):
 
 @dp.message(Command("setbio"))
 async def cmd_set_bio(message: Message):
-    """
-    /setbio <text>  — manually update your bio.
-    Works in both private and group chats.
-    """
+    """/setbio <text> — manually update your bio."""
     user = message.from_user
     if not user:
         return
@@ -247,7 +368,7 @@ async def cmd_set_bio(message: Message):
     if len(parts) < 2 or not parts[1].strip():
         await message.reply(
             "Использование: /setbio <ваше досье>\n"
-            "Пример: /setbio Программист, люблю шахматы и астрофизику."
+            "Пример: /setbio Программист, люблю шахматы и квантовую физику."
         )
         return
 
@@ -255,21 +376,18 @@ async def cmd_set_bio(message: Message):
     await db.upsert_user(user.id, user.username)
     await db.set_user_bio(user.id, bio_text)
     await message.reply(
-        "Досье обновлено. Занесено в базу данных с отметкой 'актуально'. "
-        "Ваши данные теперь помогут мне генерировать более точные иронические замечания."
+        "Досье обновлено. Теперь я знаю о тебе больше, чем тебе хотелось бы. "
+        "Данные активированы для будущих атак иронией."
     )
 
 
 @dp.message(Command("frequency"))
 async def cmd_frequency(message: Message):
-    """
-    /frequency <number>  — set reply frequency for this chat (admins only).
-    """
+    """/frequency <N> — set reply frequency (admins only)."""
     user = message.from_user
     if not user:
         return
 
-    # Check admin rights
     member = await bot.get_chat_member(message.chat.id, user.id)
     if member.status not in ("administrator", "creator"):
         await message.reply("Только администраторы могут изменять частоту ответов.")
@@ -277,7 +395,7 @@ async def cmd_frequency(message: Message):
 
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip().isdigit():
-        await message.reply("Использование: /frequency <число>\nПример: /frequency 10")
+        await message.reply("Использование: /frequency <число>. Например: /frequency 10")
         return
 
     new_freq = int(parts[1].strip())
@@ -293,8 +411,8 @@ async def cmd_frequency(message: Message):
             new_freq, message.chat.id,
         )
     await message.reply(
-        f"Параметр reply_frequency установлен на {new_freq}. "
-        "Алгоритм скорректирован. Вы можете быть спокойны."
+        f"Алгоритм скорректирован. Буду отвечать каждые {new_freq} сообщений. "
+        "Можете расслабиться."
     )
 
 
