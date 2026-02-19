@@ -319,8 +319,11 @@ async def _is_image_edit_request(caption: str) -> bool:
         return False
 
 
-async def _build_dalle_prompt(image_b64: str, edit_request: str) -> str:
-    """Use GPT-4o Vision to describe the image and merge it with the edit request."""
+async def _build_dalle_prompt(image_b64: str, edit_request: str) -> str | None:
+    """
+    Use GPT-4o Vision to describe the image as a DALL-E 3 prompt and apply the edit.
+    Returns None if the image/request is unsafe or Vision refuses.
+    """
     try:
         resp = await openai_client.chat.completions.create(
             model="gpt-4o",
@@ -328,37 +331,60 @@ async def _build_dalle_prompt(image_b64: str, edit_request: str) -> str:
                 {
                     "role": "system",
                     "content": (
-                        "Ты составляешь промпт для DALL-E 3. "
-                        "Детально опиши содержимое изображения, затем примени к описанию "
-                        "следующее изменение от пользователя. "
-                        "Верни ТОЛЬКО готовый промпт на английском языке, без пояснений."
+                        "You are a DALL-E 3 prompt engineer. "
+                        "Your task: look at the image and write a detailed English prompt for DALL-E 3 "
+                        "that recreates the scene with the user's requested change applied.\n\n"
+                        "RULES:\n"
+                        "- Describe the scene, objects, colors, style, mood — NOT real people by name.\n"
+                        "- If the image shows a person, describe them generically: "
+                        "'a person with brown hair', 'a young man in a red jacket', etc.\n"
+                        "- Apply the user's edit request naturally into the description.\n"
+                        "- Output ONLY the final English prompt. No explanations, no refusals.\n"
+                        "- If the request is impossible or unsafe, output exactly: UNSAFE"
                     ),
                 },
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": f"Запрос на изменение: {edit_request}"},
+                        {"type": "text", "text": f"User edit request: {edit_request}"},
                         {
                             "type": "image_url",
                             "image_url": {
                                 "url": f"data:image/jpeg;base64,{image_b64}",
-                                "detail": "low",
+                                "detail": "high",
                             },
                         },
                     ],
                 },
             ],
-            max_tokens=300,
-            temperature=0.5,
+            max_tokens=400,
+            temperature=0.3,
         )
-        return resp.choices[0].message.content.strip()
+        result = resp.choices[0].message.content.strip()
+
+        # Detect refusals — Vision sometimes returns apologies instead of prompt
+        refusal_markers = [
+            "UNSAFE", "i'm sorry", "i cannot", "i can't", "unable to",
+            "извините", "не могу", "не могу помочь", "safety", "policy",
+        ]
+        result_lower = result.lower()
+        if any(marker.lower() in result_lower for marker in refusal_markers):
+            logger.warning("Vision refused or returned unsafe prompt: %s", result[:120])
+            return None
+
+        return result
+
     except Exception as exc:
         logger.error("Prompt build error: %s", exc)
-        return edit_request  # fallback — передаём запрос как есть
+        return None  # don't fallback to raw user text — it's not a valid DALL-E prompt
 
 
 async def _generate_image(prompt: str) -> str | None:
     """Generate image via DALL-E 3, return URL or None on error."""
+    # Final safety check — never send prompts shorter than 10 chars
+    if not prompt or len(prompt.strip()) < 10:
+        logger.warning("DALL-E prompt too short or empty, skipping.")
+        return None
     try:
         resp = await openai_client.images.generate(
             model="dall-e-3",
@@ -690,13 +716,22 @@ async def on_photo(message: Message):
         dalle_prompt = await _build_dalle_prompt(image_b64, caption)
         logger.info("DALL-E prompt: %s", dalle_prompt)
 
-        image_url = await _generate_image(dalle_prompt)
-
         # Delete "waiting" message
         try:
             await wait_msg.delete()
         except Exception:
             pass
+
+        if dalle_prompt is None:
+            # Vision refused — content policy or unsafe image
+            await message.reply(
+                "🚫 Мои нейронные цепи идентифицировали потенциальное нарушение протокола. "
+                "Данное изображение или запрос не может быть обработан генератором. "
+                "Попробуйте другой запрос или другое фото."
+            )
+            return
+
+        image_url = await _generate_image(dalle_prompt)
 
         if image_url:
             await db.increment_image_gen_count()
