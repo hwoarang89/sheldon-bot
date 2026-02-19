@@ -319,64 +319,103 @@ async def _is_image_edit_request(caption: str) -> bool:
         return False
 
 
+_REFUSAL_MARKERS = (
+    "unsafe", "i'm sorry", "i cannot", "i can't", "unable to",
+    "извините", "не могу", "safety", "policy", "can't assist",
+    "cannot assist", "i won't", "i will not",
+)
+
+
+def _is_refusal(text: str) -> bool:
+    t = text.lower()
+    return any(m in t for m in _REFUSAL_MARKERS)
+
+
 async def _build_dalle_prompt(image_b64: str, edit_request: str) -> str | None:
     """
-    Use GPT-4o Vision to describe the image as a DALL-E 3 prompt and apply the edit.
-    Returns None if the image/request is unsafe or Vision refuses.
+    Two-stage DALL-E 3 prompt builder.
+
+    Stage 1 — Vision (with image): ask GPT-4o to describe the scene generically
+               and embed the user's edit. Works for objects, landscapes, animals.
+    Stage 2 — Text-only fallback: if Vision refuses (common with photos of people),
+               build a reasonable prompt from the edit_request alone.
+    Returns a prompt string, or None only if both stages fail.
     """
+
+    # ── Stage 1: Vision ───────────────────────────────────────────────────
+    vision_system = (
+        "You are a creative DALL-E 3 prompt writer. "
+        "Given an image and an edit request, output ONE detailed English prompt "
+        "for DALL-E 3 that applies the requested change.\n\n"
+        "KEY RULES:\n"
+        "• DO NOT mention real names or identities.\n"
+        "• Describe any people by appearance only: age, hair color, clothing, pose.\n"
+        "• Focus on scene, lighting, style, mood, background, objects.\n"
+        "• Apply the edit request directly into the scene description.\n"
+        "• Output ONLY the prompt text — no preamble, no explanations.\n"
+        "• If you truly cannot process the image, output exactly four letters: SKIP"
+    )
     try:
         resp = await openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a DALL-E 3 prompt engineer. "
-                        "Your task: look at the image and write a detailed English prompt for DALL-E 3 "
-                        "that recreates the scene with the user's requested change applied.\n\n"
-                        "RULES:\n"
-                        "- Describe the scene, objects, colors, style, mood — NOT real people by name.\n"
-                        "- If the image shows a person, describe them generically: "
-                        "'a person with brown hair', 'a young man in a red jacket', etc.\n"
-                        "- Apply the user's edit request naturally into the description.\n"
-                        "- Output ONLY the final English prompt. No explanations, no refusals.\n"
-                        "- If the request is impossible or unsafe, output exactly: UNSAFE"
-                    ),
-                },
+                {"role": "system", "content": vision_system},
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": f"User edit request: {edit_request}"},
+                        {"type": "text", "text": f"Edit request: {edit_request}"},
                         {
                             "type": "image_url",
                             "image_url": {
                                 "url": f"data:image/jpeg;base64,{image_b64}",
-                                "detail": "high",
+                                "detail": "low",   # low = cheaper + fewer refusals
                             },
                         },
                     ],
                 },
             ],
-            max_tokens=400,
-            temperature=0.3,
+            max_tokens=350,
+            temperature=0.2,
         )
         result = resp.choices[0].message.content.strip()
 
-        # Detect refusals — Vision sometimes returns apologies instead of prompt
-        refusal_markers = [
-            "UNSAFE", "i'm sorry", "i cannot", "i can't", "unable to",
-            "извините", "не могу", "не могу помочь", "safety", "policy",
-        ]
-        result_lower = result.lower()
-        if any(marker.lower() in result_lower for marker in refusal_markers):
-            logger.warning("Vision refused or returned unsafe prompt: %s", result[:120])
-            return None
-
-        return result
+        if result.upper().startswith("SKIP") or _is_refusal(result):
+            logger.warning("Vision stage refused (falling back to text-only): %s", result[:80])
+        elif len(result) >= 15:
+            logger.info("DALL-E prompt (vision): %s", result[:120])
+            return result
 
     except Exception as exc:
-        logger.error("Prompt build error: %s", exc)
-        return None  # don't fallback to raw user text — it's not a valid DALL-E prompt
+        logger.warning("Vision stage error: %s — falling back to text-only", exc)
+
+    # ── Stage 2: Text-only fallback ───────────────────────────────────────
+    # Vision refused or failed — generate a standalone prompt from the request text.
+    text_system = (
+        "You are a DALL-E 3 prompt writer. "
+        "The user wants an image based on their description. "
+        "Expand it into a rich, detailed English prompt suitable for DALL-E 3. "
+        "Output ONLY the prompt, no explanations."
+    )
+    try:
+        resp2 = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": text_system},
+                {"role": "user", "content": edit_request},
+            ],
+            max_tokens=250,
+            temperature=0.5,
+        )
+        result2 = resp2.choices[0].message.content.strip()
+        if _is_refusal(result2) or len(result2) < 10:
+            logger.warning("Text-only stage also refused: %s", result2[:80])
+            return None
+        logger.info("DALL-E prompt (text-only fallback): %s", result2[:120])
+        return result2
+
+    except Exception as exc:
+        logger.error("Text-only fallback error: %s", exc)
+        return None
 
 
 async def _generate_image(prompt: str) -> str | None:
@@ -723,11 +762,10 @@ async def on_photo(message: Message):
             pass
 
         if dalle_prompt is None:
-            # Vision refused — content policy or unsafe image
             await message.reply(
-                "🚫 Мои нейронные цепи идентифицировали потенциальное нарушение протокола. "
-                "Данное изображение или запрос не может быть обработан генератором. "
-                "Попробуйте другой запрос или другое фото."
+                "🚫 Оба контура нейросети отказали. "
+                "Попробуй переформулировать запрос или описать желаемое словами — "
+                "например: <i>«нарисуй закат на море в стиле аниме»</i>."
             )
             return
 
