@@ -2,9 +2,10 @@
 database.py — asyncpg-based database layer for Sheldon Bot.
 
 Tables:
-  users         — user_id, username, bio
-  messages      — id, user_id, chat_id, text, timestamp  (last 100 per chat)
-  chat_settings — chat_id, message_count, reply_frequency
+  users              — user_id, username, bio
+  messages           — id, user_id, chat_id, text, timestamp  (last 100 per chat)
+  chat_settings      — chat_id, message_count, reply_frequency
+  image_gen_log      — id, date, count  (global daily DALL-E counter)
 """
 
 import os
@@ -70,6 +71,14 @@ async def init_db() -> None:
                 chat_id          BIGINT PRIMARY KEY,
                 message_count    INTEGER NOT NULL DEFAULT 0,
                 reply_frequency  INTEGER NOT NULL DEFAULT 5
+            )
+        """)
+
+        # Global daily DALL-E generation counter (one row per calendar date)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS image_gen_log (
+                date   DATE    PRIMARY KEY,
+                count  INTEGER NOT NULL DEFAULT 0
             )
         """)
 
@@ -210,3 +219,37 @@ async def increase_reply_frequency(chat_id: int, delta: int = 5) -> int:
             RETURNING reply_frequency
         """, delta, chat_id)
         return row["reply_frequency"]
+
+
+# ─── Image generation daily counter ──────────────────────────────────────────
+
+IMAGE_GEN_DAILY_LIMIT = 10
+
+
+async def get_image_gen_count_today() -> int:
+    """Return how many images have been generated today (UTC date)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT count FROM image_gen_log WHERE date = CURRENT_DATE"
+        )
+        return row["count"] if row else 0
+
+
+async def increment_image_gen_count() -> int:
+    """Increment today's counter and return the new value."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO image_gen_log (date, count)
+            VALUES (CURRENT_DATE, 1)
+            ON CONFLICT (date) DO UPDATE
+                SET count = image_gen_log.count + 1
+            RETURNING count
+        """)
+        return row["count"]
+
+
+async def image_gen_allowed() -> bool:
+    """Return True if we haven't hit the daily limit yet."""
+    return (await get_image_gen_count_today()) < IMAGE_GEN_DAILY_LIMIT

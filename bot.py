@@ -149,6 +149,89 @@ async def _ask_sheldon_about_image(chat_id: int, image_b64: str, caption: str | 
         return "Я попытался проанализировать это изображение, но мои фотонные рецепторы отказали."
 
 
+async def _is_image_edit_request(caption: str) -> bool:
+    """Ask GPT-4o whether the caption is a request to modify/redraw the image."""
+    if not caption or len(caption.strip()) < 3:
+        return False
+    try:
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты определяешь намерение. "
+                        "Если текст — просьба изменить, перерисовать, отредактировать изображение "
+                        "(например: 'сделай фон космосом', 'добавь шляпу', 'в стиле аниме', "
+                        "'убери человека', 'перекрась в синий') — ответь ТОЛЬКО словом YES. "
+                        "Если это просто комментарий или вопрос — ответь ТОЛЬКО словом NO."
+                    ),
+                },
+                {"role": "user", "content": caption},
+            ],
+            max_tokens=5,
+            temperature=0,
+        )
+        answer = resp.choices[0].message.content.strip().upper()
+        return answer.startswith("YES")
+    except Exception:
+        return False
+
+
+async def _build_dalle_prompt(image_b64: str, edit_request: str) -> str:
+    """Use GPT-4o Vision to describe the image and merge it with the edit request."""
+    try:
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты составляешь промпт для DALL-E 3. "
+                        "Детально опиши содержимое изображения, затем примени к описанию "
+                        "следующее изменение от пользователя. "
+                        "Верни ТОЛЬКО готовый промпт на английском языке, без пояснений."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Запрос на изменение: {edit_request}"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_b64}",
+                                "detail": "low",
+                            },
+                        },
+                    ],
+                },
+            ],
+            max_tokens=300,
+            temperature=0.5,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as exc:
+        logger.error("Prompt build error: %s", exc)
+        return edit_request  # fallback — передаём запрос как есть
+
+
+async def _generate_image(prompt: str) -> str | None:
+    """Generate image via DALL-E 3, return URL or None on error."""
+    try:
+        resp = await openai_client.images.generate(
+            model="dall-e-3",
+            prompt=prompt,
+            size="1024x1024",
+            quality="standard",
+            n=1,
+        )
+        return resp.data[0].url
+    except Exception as exc:
+        logger.error("DALL-E error: %s", exc)
+        return None
+
+
 async def _transcribe_voice(file_bytes: bytes, mime: str = "audio/ogg") -> str:
     """Transcribe voice message using OpenAI Whisper."""
     try:
@@ -206,7 +289,11 @@ async def on_new_member(event: ChatMemberUpdated):
 
 @dp.message(F.photo & F.chat.type.in_({"group", "supergroup", "private"}))
 async def on_photo(message: Message):
-    """Handle photos — describe and comment in Sheldon's style."""
+    """
+    Handle photos:
+      - If caption is an edit/redraw request → generate via DALL-E 3 (max 10/day).
+      - Otherwise → comment in Sheldon's style using GPT-4o Vision.
+    """
     user = message.from_user
     if not user or user.is_bot:
         return
@@ -215,12 +302,10 @@ async def on_photo(message: Message):
     await db.upsert_user(user.id, user.username)
     await db.ensure_chat_exists(chat_id)
 
-    # Save caption as message if present
     caption = message.caption or ""
     if caption:
         await db.save_message(user.id, chat_id, f"[фото] {caption}")
 
-    # Check if direct mention (caption with @bot)
     is_mention = await _is_direct_mention(message)
 
     # In groups respond only on mention or by counter
@@ -230,14 +315,63 @@ async def on_photo(message: Message):
             return
         await db.reset_message_count(chat_id)
 
-    # Download best photo (largest size)
+    # Download photo once — needed for both paths
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     file_bytes = await bot.download_file(file.file_path)
     image_b64 = base64.b64encode(file_bytes.read()).decode("utf-8")
 
-    reply_text = await _ask_sheldon_about_image(chat_id, image_b64, caption or None)
-    await message.reply(reply_text)
+    # ── Detect if user wants image editing ────────────────────────────────
+    wants_edit = await _is_image_edit_request(caption)
+
+    if wants_edit:
+        # Check daily limit
+        if not await db.image_gen_allowed():
+            used = await db.get_image_gen_count_today()
+            await message.reply(
+                f"🚫 Лимит исчерпан. За сегодня сгенерировано {used}/{db.IMAGE_GEN_DAILY_LIMIT} изображений. "
+                "Мои вычислительные мощности не бесконечны — приходите завтра."
+            )
+            return
+
+        # Notify chat that generation is in progress
+        remaining = db.IMAGE_GEN_DAILY_LIMIT - await db.get_image_gen_count_today()
+        wait_msg = await message.reply(
+            f"🎨 Активирую нейросеть DALL-E 3... Обрабатываю запрос: <i>{caption}</i>\n"
+            f"⏳ Генерация занимает ~15 секунд. Осталось попыток сегодня: {remaining - 1} из {db.IMAGE_GEN_DAILY_LIMIT}."
+        )
+
+        # Build rich prompt via Vision, then generate
+        dalle_prompt = await _build_dalle_prompt(image_b64, caption)
+        logger.info("DALL-E prompt: %s", dalle_prompt)
+
+        image_url = await _generate_image(dalle_prompt)
+
+        # Delete "waiting" message
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+
+        if image_url:
+            await db.increment_image_gen_count()
+            count_now = await db.get_image_gen_count_today()
+            await message.reply_photo(
+                photo=image_url,
+                caption=(
+                    f"✅ Готово. Применил: «{caption}»\n"
+                    f"Использовано сегодня: {count_now}/{db.IMAGE_GEN_DAILY_LIMIT}."
+                ),
+            )
+        else:
+            await message.reply(
+                "Что-то пошло не так в моих нейросетевых цепях. "
+                "DALL-E отказал в сотрудничестве. Попробуйте позже."
+            )
+    else:
+        # Regular Vision comment
+        reply_text = await _ask_sheldon_about_image(chat_id, image_b64, caption or None)
+        await message.reply(reply_text)
 
     if is_mention:
         await db.reset_message_count(chat_id)
