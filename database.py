@@ -4,8 +4,9 @@ database.py — asyncpg-based database layer for Sheldon Bot.
 Tables:
   users              — user_id, username, bio
   messages           — id, user_id, chat_id, text, timestamp  (last 100 per chat)
-  chat_settings      — chat_id, message_count, reply_frequency
-  image_gen_log      — id, date, count  (global daily DALL-E counter)
+  chat_settings      — chat_id, message_count, reply_frequency, last_activity
+  chat_members       — chat_id, user_id  (known members for proactive pokes)
+  image_gen_log      — date, count  (global daily DALL-E counter)
 """
 
 import os
@@ -68,9 +69,24 @@ async def init_db() -> None:
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS chat_settings (
-                chat_id          BIGINT PRIMARY KEY,
-                message_count    INTEGER NOT NULL DEFAULT 0,
-                reply_frequency  INTEGER NOT NULL DEFAULT 5
+                chat_id          BIGINT    PRIMARY KEY,
+                message_count    INTEGER   NOT NULL DEFAULT 0,
+                reply_frequency  INTEGER   NOT NULL DEFAULT 5,
+                last_activity    TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """)
+        # Add last_activity column if missing (for existing deployments)
+        await conn.execute("""
+            ALTER TABLE chat_settings
+                ADD COLUMN IF NOT EXISTS last_activity TIMESTAMP NOT NULL DEFAULT NOW()
+        """)
+
+        # Known group members — used for proactive @mentions
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_members (
+                chat_id  BIGINT NOT NULL,
+                user_id  BIGINT NOT NULL,
+                PRIMARY KEY (chat_id, user_id)
             )
         """)
 
@@ -253,3 +269,70 @@ async def increment_image_gen_count() -> int:
 async def image_gen_allowed() -> bool:
     """Return True if we haven't hit the daily limit yet."""
     return (await get_image_gen_count_today()) < IMAGE_GEN_DAILY_LIMIT
+
+
+# ─── Chat members (for proactive pokes) ──────────────────────────────────────
+
+async def add_chat_member(chat_id: int, user_id: int) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO chat_members (chat_id, user_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+        """, chat_id, user_id)
+
+
+async def get_chat_members(chat_id: int) -> list[asyncpg.Record]:
+    """Return all known (chat_id, user_id) pairs joined with users table."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
+            SELECT cm.user_id, u.username, u.bio
+            FROM   chat_members cm
+            JOIN   users u ON u.user_id = cm.user_id
+            WHERE  cm.chat_id = $1
+        """, chat_id)
+
+
+async def get_members_without_bio(chat_id: int) -> list[asyncpg.Record]:
+    """Return known members who have no bio yet."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
+            SELECT cm.user_id, u.username
+            FROM   chat_members cm
+            JOIN   users u ON u.user_id = cm.user_id
+            WHERE  cm.chat_id = $1
+              AND  (u.bio IS NULL OR u.bio = '')
+        """, chat_id)
+
+
+# ─── Last activity tracking ───────────────────────────────────────────────────
+
+async def touch_last_activity(chat_id: int) -> None:
+    """Update last_activity timestamp for a chat to now."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await _ensure_chat(chat_id, conn)
+        await conn.execute("""
+            UPDATE chat_settings SET last_activity = NOW() WHERE chat_id = $1
+        """, chat_id)
+
+
+async def get_silent_chats(silent_minutes: int = 60) -> list[asyncpg.Record]:
+    """Return chats where nobody wrote for at least *silent_minutes* minutes."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
+            SELECT chat_id FROM chat_settings
+            WHERE  last_activity < NOW() - ($1 * INTERVAL '1 minute')
+        """, silent_minutes)
+
+
+async def get_all_chat_ids() -> list[int]:
+    """Return all known chat IDs."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT chat_id FROM chat_settings")
+        return [r["chat_id"] for r in rows]

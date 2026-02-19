@@ -9,10 +9,12 @@ Environment variables required (.env):
   DATABASE_URL
 """
 
+import asyncio
 import base64
 import io
 import logging
 import os
+import random
 import re
 
 from aiogram import Bot, Dispatcher, F
@@ -265,21 +267,205 @@ async def _is_direct_mention(message: Message) -> bool:
     return False
 
 
+async def _generate_question_for_user(username: str, bio: str, chat_id: int) -> str:
+    """Ask GPT-4o to generate a personal question targeting a specific user."""
+    history = await db.get_recent_messages(chat_id, limit=20)
+    history_text = "\n".join(
+        f"{r['username'] or r['user_id']}: {r['text']}" for r in history
+    ) or "Чат пока молчит."
+
+    bio_note = f"Досье: {bio}" if bio else "Досье пока пустое — человек-загадка."
+    try:
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": SHELDON_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Обратись лично к участнику @{username}. {bio_note}\n"
+                        f"История чата:\n{history_text}\n\n"
+                        "Задай ему один конкретный, остроумный вопрос о его жизни, хобби или характере — "
+                        "чтобы лучше его узнать и пополнить базу данных. "
+                        "Обязательно упомяни его @username в тексте. Коротко — 1-2 предложения."
+                    ),
+                },
+            ],
+            max_tokens=150,
+            temperature=0.95,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as exc:
+        logger.error("Question gen error: %s", exc)
+        return f"@{username}, давно хотел спросить: чем ты вообще занимаешься в жизни?"
+
+
+async def _generate_silence_breaker(chat_id: int) -> str:
+    """Generate a proactive message to break the silence in a chat."""
+    members = await db.get_chat_members(chat_id)
+    members_desc = ", ".join(
+        f"@{m['username']} ({m['bio'] or 'досье не заполнено'})"
+        for m in members if m["username"]
+    ) or "группа загадочных незнакомцев"
+
+    history = await db.get_recent_messages(chat_id, limit=10)
+    last_topic = history[-1]["text"] if history else "ничего интересного"
+
+    try:
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": SHELDON_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"В чате давно тишина. Участники: {members_desc}.\n"
+                        f"Последняя тема была: {last_topic}\n\n"
+                        "Напиши провокационное, остроумное сообщение чтобы расшевелить чат. "
+                        "Можешь упомянуть кого-то из участников через @username. "
+                        "1-2 предложения максимум."
+                    ),
+                },
+            ],
+            max_tokens=150,
+            temperature=1.0,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as exc:
+        logger.error("Silence breaker error: %s", exc)
+        return "Господа, тишина в чате нарушает мой алгоритм социального взаимодействия. Кто-нибудь жив?"
+
+
+async def _generate_deploy_announcement(chat_id: int) -> str:
+    """Generate a message announcing what the bot has learned about chat members."""
+    members = await db.get_chat_members(chat_id)
+    members_with_bio = [m for m in members if m["bio"]]
+
+    if not members_with_bio:
+        return (
+            "Обновление системы завершено. "
+            "К сожалению, моя база данных на участников этого чата практически пуста. "
+            "Вы все — белые пятна на карте моего интеллекта. Это неприемлемо."
+        )
+
+    bio_summary = "\n".join(
+        f"- @{m['username']}: {m['bio']}" for m in members_with_bio if m["username"]
+    )
+    try:
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": SHELDON_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Напиши короткое объявление в стиле Шелдона: что ты узнал об участниках чата. "
+                        f"Вот их досье:\n{bio_summary}\n\n"
+                        "Кратко, с иронией, упомяни 1-2 участников по @username. "
+                        "Можешь пошутить на основе их хобби. 2-3 предложения."
+                    ),
+                },
+            ],
+            max_tokens=200,
+            temperature=0.95,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as exc:
+        logger.error("Deploy announcement error: %s", exc)
+        return "Обновление завершено. Мои алгоритмы стали острее. Берегитесь."
+
+
+# ─── Proactive scheduler ──────────────────────────────────────────────────────
+
+async def _scheduler_loop():
+    """
+    Background loop running every minute.
+    Tasks:
+      1. Every 90 min of silence → poke the chat or ask someone a question.
+      2. On startup → announce what the bot knows about members (deploy message).
+    """
+    # Small delay on startup so DB is ready
+    await asyncio.sleep(10)
+
+    # ── Deploy announcement (once per startup, to all known chats) ─────────
+    chat_ids = await db.get_all_chat_ids()
+    for chat_id in chat_ids:
+        if chat_id >= 0:          # skip private chats (positive IDs)
+            continue
+        try:
+            announcement = await _generate_deploy_announcement(chat_id)
+            await bot.send_message(chat_id, f"🔄 <b>Перезагрузка завершена.</b>\n\n{announcement}")
+            logger.info("Deploy announcement sent to %s", chat_id)
+        except Exception as exc:
+            logger.warning("Deploy announcement failed for %s: %s", chat_id, exc)
+
+    # ── Periodic silence-breaker loop ─────────────────────────────────────
+    CHECK_INTERVAL = 60        # check every 60 seconds
+    SILENCE_THRESHOLD = 90     # poke after 90 minutes of silence
+
+    while True:
+        await asyncio.sleep(CHECK_INTERVAL)
+        try:
+            silent_chats = await db.get_silent_chats(silent_minutes=SILENCE_THRESHOLD)
+            for row in silent_chats:
+                chat_id = row["chat_id"]
+                if chat_id >= 0:   # skip private chats
+                    continue
+
+                # 50% chance to ask a specific user, 50% to break silence generally
+                members_no_bio = await db.get_members_without_bio(chat_id)
+                all_members = await db.get_chat_members(chat_id)
+
+                if members_no_bio and random.random() < 0.6:
+                    # Ask someone who has no bio yet
+                    target = random.choice(members_no_bio)
+                    username = target["username"]
+                    if not username:
+                        continue
+                    question = await _generate_question_for_user(
+                        username, target.get("bio", ""), chat_id
+                    )
+                    await bot.send_message(chat_id, question)
+                    logger.info("Bio question sent to @%s in %s", username, chat_id)
+                elif all_members:
+                    # Pick a random known member and ask something personal
+                    with_username = [m for m in all_members if m["username"]]
+                    if with_username and random.random() < 0.5:
+                        target = random.choice(with_username)
+                        question = await _generate_question_for_user(
+                            target["username"], target.get("bio", ""), chat_id
+                        )
+                        await bot.send_message(chat_id, question)
+                    else:
+                        # General silence breaker
+                        msg = await _generate_silence_breaker(chat_id)
+                        await bot.send_message(chat_id, msg)
+
+                # Update last_activity so we don't spam every minute
+                await db.touch_last_activity(chat_id)
+
+        except Exception as exc:
+            logger.error("Scheduler error: %s", exc)
+
+
 # ─── Handlers ─────────────────────────────────────────────────────────────────
 
 @dp.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
 async def on_new_member(event: ChatMemberUpdated):
-    """Greet newcomers in Sheldon's style."""
+    """Greet newcomers in Sheldon's style and register them."""
     new_user = event.new_chat_member.user
     if new_user.is_bot:
         return
 
     await db.upsert_user(new_user.id, new_user.username)
     await db.ensure_chat_exists(event.chat.id)
+    await db.add_chat_member(event.chat.id, new_user.id)
+    await db.touch_last_activity(event.chat.id)
 
     first_name = new_user.first_name or "Незнакомец"
+    username_tag = f"@{new_user.username}" if new_user.username else f"<b>{first_name}</b>"
     greeting = (
-        f"Оповещение: к нашему социальному эксперименту присоединился <b>{first_name}</b>. "
+        f"Оповещение: к нашему социальному эксперименту присоединился {username_tag}. "
         f"Надеюсь, твой IQ выше среднего — хотя статистика не на твоей стороне.\n\n"
         f"Для каталогизации: кто ты, чем занимаешься, каковы хобби? "
         f"Данные будут занесены в базу для последующих иронических атак."
@@ -301,6 +487,8 @@ async def on_photo(message: Message):
     chat_id = message.chat.id
     await db.upsert_user(user.id, user.username)
     await db.ensure_chat_exists(chat_id)
+    await db.add_chat_member(chat_id, user.id)
+    await db.touch_last_activity(chat_id)
 
     caption = message.caption or ""
     if caption:
@@ -387,6 +575,8 @@ async def on_voice(message: Message):
     chat_id = message.chat.id
     await db.upsert_user(user.id, user.username)
     await db.ensure_chat_exists(chat_id)
+    await db.add_chat_member(chat_id, user.id)
+    await db.touch_last_activity(chat_id)
 
     is_mention = await _is_direct_mention(message)
 
@@ -437,6 +627,8 @@ async def on_group_message(message: Message):
     chat_id = message.chat.id
 
     await db.upsert_user(user.id, user.username)
+    await db.add_chat_member(chat_id, user.id)   # register as known member
+    await db.touch_last_activity(chat_id)         # update silence timer
     await db.save_message(user.id, chat_id, text)
 
     # ── Bio collection ─────────────────────────────────────────────────────
@@ -557,6 +749,9 @@ async def on_startup():
     await db.init_db()
     me = await bot.get_me()
     logger.info("Bot started: @%s", me.username)
+    # Launch proactive scheduler as background task
+    asyncio.create_task(_scheduler_loop())
+    logger.info("Proactive scheduler started.")
 
 
 async def on_shutdown():
