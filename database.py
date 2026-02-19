@@ -69,23 +69,42 @@ async def init_db() -> None:
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS chat_settings (
-                chat_id          BIGINT    PRIMARY KEY,
-                message_count    INTEGER   NOT NULL DEFAULT 0,
-                reply_frequency  INTEGER   NOT NULL DEFAULT 5,
-                last_activity    TIMESTAMP NOT NULL DEFAULT NOW()
+                chat_id            BIGINT    PRIMARY KEY,
+                message_count      INTEGER   NOT NULL DEFAULT 0,
+                reply_frequency    INTEGER   NOT NULL DEFAULT 5,
+                humor_level        INTEGER   NOT NULL DEFAULT 5,
+                last_activity      TIMESTAMP NOT NULL DEFAULT NOW(),
+                next_poke_at       TIMESTAMP NOT NULL DEFAULT NOW(),
+                max_response_lines INTEGER   NOT NULL DEFAULT 3
             )
         """)
-        # Add last_activity column if missing (for existing deployments)
-        await conn.execute("""
-            ALTER TABLE chat_settings
-                ADD COLUMN IF NOT EXISTS last_activity TIMESTAMP NOT NULL DEFAULT NOW()
-        """)
+        # Safe migrations for existing deployments
+        for col, definition in [
+            ("last_activity",      "TIMESTAMP NOT NULL DEFAULT NOW()"),
+            ("next_poke_at",       "TIMESTAMP NOT NULL DEFAULT NOW()"),
+            ("humor_level",        "INTEGER NOT NULL DEFAULT 5"),
+            ("max_response_lines", "INTEGER NOT NULL DEFAULT 3"),
+        ]:
+            await conn.execute(f"""
+                ALTER TABLE chat_settings
+                    ADD COLUMN IF NOT EXISTS {col} {definition}
+            """)
 
         # Known group members — used for proactive @mentions
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS chat_members (
                 chat_id  BIGINT NOT NULL,
                 user_id  BIGINT NOT NULL,
+                PRIMARY KEY (chat_id, user_id)
+            )
+        """)
+
+        # Per-user ignore list: bot won't address this user until ignore_until
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_ignore (
+                chat_id      BIGINT    NOT NULL,
+                user_id      BIGINT    NOT NULL,
+                ignore_until TIMESTAMP NOT NULL,
                 PRIMARY KEY (chat_id, user_id)
             )
         """)
@@ -336,3 +355,87 @@ async def get_all_chat_ids() -> list[int]:
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT chat_id FROM chat_settings")
         return [r["chat_id"] for r in rows]
+
+
+# ─── Chat settings: humor, response length, poke schedule ────────────────────
+
+async def set_humor_level(chat_id: int, level: int) -> None:
+    """Set humor level 1-10 (1=dry, 10=maximum jokes)."""
+    level = max(1, min(10, level))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await _ensure_chat(chat_id, conn)
+        await conn.execute(
+            "UPDATE chat_settings SET humor_level = $1 WHERE chat_id = $2",
+            level, chat_id
+        )
+
+
+async def set_max_response_lines(chat_id: int, lines: int) -> None:
+    """Set max response length in lines (1-10)."""
+    lines = max(1, min(10, lines))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await _ensure_chat(chat_id, conn)
+        await conn.execute(
+            "UPDATE chat_settings SET max_response_lines = $1 WHERE chat_id = $2",
+            lines, chat_id
+        )
+
+
+async def set_next_poke_at(chat_id: int, minutes_from_now: int) -> None:
+    """Schedule next proactive poke at now + N minutes."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await _ensure_chat(chat_id, conn)
+        await conn.execute("""
+            UPDATE chat_settings
+            SET next_poke_at = NOW() + ($1 * INTERVAL '1 minute')
+            WHERE chat_id = $2
+        """, minutes_from_now, chat_id)
+
+
+async def get_chats_due_for_poke() -> list[asyncpg.Record]:
+    """Return chats where next_poke_at is in the past."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
+            SELECT chat_id, humor_level, max_response_lines
+            FROM   chat_settings
+            WHERE  next_poke_at <= NOW()
+              AND  last_activity < next_poke_at
+        """)
+
+
+async def get_full_chat_settings(chat_id: int) -> asyncpg.Record:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await _ensure_chat(chat_id, conn)
+        return await conn.fetchrow(
+            "SELECT * FROM chat_settings WHERE chat_id = $1", chat_id
+        )
+
+
+# ─── Per-user ignore ──────────────────────────────────────────────────────────
+
+async def set_user_ignore(chat_id: int, user_id: int, until_ts) -> None:
+    """Tell the bot to not address this user until until_ts."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO user_ignore (chat_id, user_id, ignore_until)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (chat_id, user_id) DO UPDATE
+                SET ignore_until = EXCLUDED.ignore_until
+        """, chat_id, user_id, until_ts)
+
+
+async def is_user_ignored(chat_id: int, user_id: int) -> bool:
+    """Return True if the bot should not proactively address this user right now."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT 1 FROM user_ignore
+            WHERE  chat_id = $1 AND user_id = $2 AND ignore_until > NOW()
+        """, chat_id, user_id)
+        return row is not None

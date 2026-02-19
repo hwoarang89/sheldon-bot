@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import re
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -84,6 +85,120 @@ SLOW_DOWN_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# ─── Natural language settings patterns ──────────────────────────────────────
+
+# Maps regex → (action, value)
+# action: "humor_up" | "humor_down" | "freq_up" | "freq_down"
+#         | "length_down" | "length_up" | "ignore_me"
+SETTINGS_PATTERNS: list[tuple[re.Pattern, str, int]] = [
+    # HUMOR up
+    (re.compile(r"шути\s+(чаще|больше|активнее|веселее|смешнее|лучше)", re.I), "humor_up", 2),
+    (re.compile(r"больше\s+(юмора|шуток|приколов)", re.I), "humor_up", 2),
+    (re.compile(r"будь\s+(смешнее|веселее|прикольнее)", re.I), "humor_up", 2),
+
+    # HUMOR down
+    (re.compile(r"шути\s+(реже|меньше|потише|потиш)", re.I), "humor_down", 2),
+    (re.compile(r"меньше\s+(юмора|шуток|приколов)", re.I), "humor_down", 2),
+    (re.compile(r"(плохая|не смешная|несмешная)\s+шутка", re.I), "humor_down", 1),
+    (re.compile(r"не\s+смешно", re.I), "humor_down", 1),
+
+    # FREQUENCY up (bot writes MORE often)
+    (re.compile(r"пиши\s+(чаще|активнее|больше)", re.I), "freq_up", 3),
+    (re.compile(r"отвечай\s+(чаще|активнее)", re.I), "freq_up", 3),
+
+    # FREQUENCY down (bot writes LESS often)
+    (re.compile(r"пиши\s+реже", re.I), "freq_down", 5),
+    (re.compile(r"заткнись|помолчи|замолчи", re.I), "freq_down", 5),
+    (re.compile(r"устал\s+от\s+тебя", re.I), "freq_down", 5),
+    (re.compile(r"отвечай\s+реже", re.I), "freq_down", 5),
+
+    # LENGTH down (shorter replies)
+    (re.compile(r"пиши\s+(короче|меньше|кратче|лаконичнее)", re.I), "length_down", 1),
+    (re.compile(r"отвечай\s+(короче|кратко|меньше)", re.I), "length_down", 1),
+    (re.compile(r"(слишком\s+длинно|много\s+текста|много\s+букв)", re.I), "length_down", 1),
+
+    # LENGTH up (longer replies)
+    (re.compile(r"пиши\s+(подробнее|больше|развёрнуто|развернуто)", re.I), "length_up", 1),
+    (re.compile(r"отвечай\s+(подробнее|развёрнуто)", re.I), "length_up", 1),
+
+    # IGNORE ME for N days
+    (re.compile(r"не\s+обращайся\s+ко\s+мне\s+(\d+)\s+дн", re.I), "ignore_me", 0),
+    (re.compile(r"игнорируй\s+меня\s+(\d+)\s+дн", re.I),            "ignore_me", 0),
+    (re.compile(r"не\s+трогай\s+меня\s+(\d+)\s+дн", re.I),          "ignore_me", 0),
+    (re.compile(r"оставь\s+меня\s+в\s+покое\s+(\d+)\s+дн", re.I),   "ignore_me", 0),
+]
+
+
+async def _detect_and_apply_settings(message_text: str, chat_id: int, user_id: int) -> str | None:
+    """
+    Scan text for natural-language setting commands.
+    Apply changes to DB. Return a confirmation reply or None if nothing matched.
+    Multiple patterns can match in one message.
+    """
+    applied: list[str] = []
+
+    for pattern, action, delta in SETTINGS_PATTERNS:
+        m = pattern.search(message_text)
+        if not m:
+            continue
+
+        if action == "humor_up":
+            settings = await db.get_full_chat_settings(chat_id)
+            new_val = min(10, settings["humor_level"] + delta)
+            await db.set_humor_level(chat_id, new_val)
+            applied.append(f"уровень юмора → {new_val}/10")
+
+        elif action == "humor_down":
+            settings = await db.get_full_chat_settings(chat_id)
+            new_val = max(1, settings["humor_level"] - delta)
+            await db.set_humor_level(chat_id, new_val)
+            applied.append(f"уровень юмора → {new_val}/10")
+
+        elif action == "freq_up":
+            settings = await db.get_full_chat_settings(chat_id)
+            new_val = max(1, settings["reply_frequency"] - delta)
+            pool = await db.get_pool()
+            async with pool.acquire() as conn:
+                await db._ensure_chat(chat_id, conn)
+                await conn.execute(
+                    "UPDATE chat_settings SET reply_frequency=$1 WHERE chat_id=$2",
+                    new_val, chat_id
+                )
+            applied.append(f"частота ответов → каждые {new_val} сообщений")
+
+        elif action == "freq_down":
+            new_val = await db.increase_reply_frequency(chat_id, delta=delta)
+            applied.append(f"частота ответов → каждые {new_val} сообщений")
+
+        elif action == "length_down":
+            settings = await db.get_full_chat_settings(chat_id)
+            new_val = max(1, settings["max_response_lines"] - delta)
+            await db.set_max_response_lines(chat_id, new_val)
+            applied.append(f"длина ответа → {new_val} предл.")
+
+        elif action == "length_up":
+            settings = await db.get_full_chat_settings(chat_id)
+            new_val = min(10, settings["max_response_lines"] + delta)
+            await db.set_max_response_lines(chat_id, new_val)
+            applied.append(f"длина ответа → {new_val} предл.")
+
+        elif action == "ignore_me":
+            days = int(m.group(1)) if m.lastindex and m.group(1) else 1
+            days = max(1, min(30, days))
+            until = datetime.utcnow() + timedelta(days=days)
+            await db.set_user_ignore(chat_id, user_id, until)
+            applied.append(f"не буду обращаться к тебе {days} дн.")
+
+    if not applied:
+        return None
+
+    changes = ", ".join(dict.fromkeys(applied))  # deduplicate, keep order
+    return (
+        f"Принято. Скорректировал алгоритмы: {changes}. "
+        "Надеюсь, это удовлетворит ваши социальные требования."
+    )
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _build_chat_history(records: list) -> list[dict]:
@@ -98,21 +213,45 @@ def _build_chat_history(records: list) -> list[dict]:
     return messages
 
 
-async def _ask_sheldon(chat_id: int, trigger_text: str | None = None) -> str:
-    """Call GPT-4o with chat history as context."""
+async def _ask_sheldon(
+    chat_id: int,
+    trigger_text: str | None = None,
+    humor_override: int | None = None,
+    length_override: int | None = None,
+) -> str:
+    """Call GPT-4o with chat history + dynamic humor/length settings."""
+    settings = await db.get_full_chat_settings(chat_id)
+    humor = humor_override if humor_override is not None else settings["humor_level"]
+    max_lines = length_override if length_override is not None else settings["max_response_lines"]
+
+    # Build dynamic system prompt suffix based on settings
+    humor_desc = (
+        "Сейчас РЕЖИМ МАКСИМАЛЬНОГО ЮМОРА — каждый ответ должен быть смешным, острым, с приколом."
+        if humor >= 8 else
+        "Сейчас режим умеренного юмора — шути, но не перегибай."
+        if humor >= 5 else
+        "Сейчас МИНИМАЛЬНЫЙ ЮМОР — отвечай почти серьёзно, редкие сухие замечания."
+    )
+    length_desc = f"Максимальная длина ответа: {max_lines} предложени{'е' if max_lines == 1 else 'я' if max_lines < 5 else 'й'}."
+
+    system = SHELDON_SYSTEM_PROMPT + f"\n\nТЕКУЩИЕ НАСТРОЙКИ:\n{humor_desc}\n{length_desc}"
+
     history = await db.get_recent_messages(chat_id, limit=50)
-    messages: list[dict] = [{"role": "system", "content": SHELDON_SYSTEM_PROMPT}]
+    messages: list[dict] = [{"role": "system", "content": system}]
     messages.extend(_build_chat_history(history))
 
     if trigger_text:
         messages.append({"role": "user", "content": trigger_text})
 
+    # Scale tokens with max_lines
+    max_tokens = max(60, max_lines * 80)
+
     try:
         response = await openai_client.chat.completions.create(
             model="gpt-4o",
             messages=messages,
-            max_tokens=200,       # короче!
-            temperature=0.95,     # чуть больше креативности
+            max_tokens=max_tokens,
+            temperature=0.7 + (humor * 0.03),  # 0.73 (humor=1) … 1.0 (humor=10)
         )
         return response.choices[0].message.content.strip()
     except Exception as exc:
@@ -377,20 +516,28 @@ async def _generate_deploy_announcement(chat_id: int) -> str:
 
 # ─── Proactive scheduler ──────────────────────────────────────────────────────
 
+POKE_MIN_MINUTES = 90            # minimum silence before poke: 90 min
+POKE_MAX_MINUTES = 48 * 60       # maximum: 48 hours
+CHECK_INTERVAL   = 60            # poll DB every 60 seconds
+
+
+def _random_poke_delay() -> int:
+    """Return a random delay in minutes between POKE_MIN and POKE_MAX."""
+    return random.randint(POKE_MIN_MINUTES, POKE_MAX_MINUTES)
+
+
 async def _scheduler_loop():
     """
-    Background loop running every minute.
-    Tasks:
-      1. Every 90 min of silence → poke the chat or ask someone a question.
-      2. On startup → announce what the bot knows about members (deploy message).
+    Background loop:
+      - On startup: send deploy announcement + schedule first poke for each chat.
+      - Every 60s: check if any chat's next_poke_at has passed → poke.
     """
-    # Small delay on startup so DB is ready
-    await asyncio.sleep(10)
+    await asyncio.sleep(10)  # wait for DB + polling to be ready
 
-    # ── Deploy announcement (once per startup, to all known chats) ─────────
+    # ── Deploy announcement + initial poke scheduling ──────────────────────
     chat_ids = await db.get_all_chat_ids()
     for chat_id in chat_ids:
-        if chat_id >= 0:          # skip private chats (positive IDs)
+        if chat_id >= 0:
             continue
         try:
             announcement = await _generate_deploy_announcement(chat_id)
@@ -398,51 +545,61 @@ async def _scheduler_loop():
             logger.info("Deploy announcement sent to %s", chat_id)
         except Exception as exc:
             logger.warning("Deploy announcement failed for %s: %s", chat_id, exc)
+        # Schedule next poke with random delay
+        await db.set_next_poke_at(chat_id, _random_poke_delay())
 
-    # ── Periodic silence-breaker loop ─────────────────────────────────────
-    CHECK_INTERVAL = 60        # check every 60 seconds
-    SILENCE_THRESHOLD = 90     # poke after 90 minutes of silence
-
+    # ── Main loop ─────────────────────────────────────────────────────────
     while True:
         await asyncio.sleep(CHECK_INTERVAL)
         try:
-            silent_chats = await db.get_silent_chats(silent_minutes=SILENCE_THRESHOLD)
-            for row in silent_chats:
+            due_chats = await db.get_chats_due_for_poke()
+            for row in due_chats:
                 chat_id = row["chat_id"]
                 if chat_id >= 0:   # skip private chats
                     continue
 
-                # 50% chance to ask a specific user, 50% to break silence generally
                 members_no_bio = await db.get_members_without_bio(chat_id)
-                all_members = await db.get_chat_members(chat_id)
+                all_members    = await db.get_chat_members(chat_id)
+
+                # Filter out ignored users
+                async def _not_ignored(m) -> bool:
+                    return not await db.is_user_ignored(chat_id, m["user_id"])
+
+                members_no_bio = [m for m in members_no_bio
+                                  if not await db.is_user_ignored(chat_id, m["user_id"])]
+                with_username  = [m for m in all_members
+                                  if m["username"]
+                                  and not await db.is_user_ignored(chat_id, m["user_id"])]
+
+                poke_sent = False
 
                 if members_no_bio and random.random() < 0.6:
-                    # Ask someone who has no bio yet
                     target = random.choice(members_no_bio)
-                    username = target["username"]
-                    if not username:
-                        continue
-                    question = await _generate_question_for_user(
-                        username, target.get("bio", ""), chat_id
-                    )
-                    await bot.send_message(chat_id, question)
-                    logger.info("Bio question sent to @%s in %s", username, chat_id)
-                elif all_members:
-                    # Pick a random known member and ask something personal
-                    with_username = [m for m in all_members if m["username"]]
-                    if with_username and random.random() < 0.5:
-                        target = random.choice(with_username)
+                    if target["username"]:
                         question = await _generate_question_for_user(
                             target["username"], target.get("bio", ""), chat_id
                         )
                         await bot.send_message(chat_id, question)
-                    else:
-                        # General silence breaker
-                        msg = await _generate_silence_breaker(chat_id)
-                        await bot.send_message(chat_id, msg)
+                        logger.info("Bio question → @%s in %s", target["username"], chat_id)
+                        poke_sent = True
 
-                # Update last_activity so we don't spam every minute
+                if not poke_sent and with_username and random.random() < 0.55:
+                    target = random.choice(with_username)
+                    question = await _generate_question_for_user(
+                        target["username"], target.get("bio", ""), chat_id
+                    )
+                    await bot.send_message(chat_id, question)
+                    poke_sent = True
+
+                if not poke_sent:
+                    msg = await _generate_silence_breaker(chat_id)
+                    await bot.send_message(chat_id, msg)
+
+                # Schedule next poke with a fresh random delay
+                delay = _random_poke_delay()
+                await db.set_next_poke_at(chat_id, delay)
                 await db.touch_last_activity(chat_id)
+                logger.info("Next poke for %s in %d min", chat_id, delay)
 
         except Exception as exc:
             logger.error("Scheduler error: %s", exc)
@@ -627,8 +784,8 @@ async def on_group_message(message: Message):
     chat_id = message.chat.id
 
     await db.upsert_user(user.id, user.username)
-    await db.add_chat_member(chat_id, user.id)   # register as known member
-    await db.touch_last_activity(chat_id)         # update silence timer
+    await db.add_chat_member(chat_id, user.id)
+    await db.touch_last_activity(chat_id)
     await db.save_message(user.id, chat_id, text)
 
     # ── Bio collection ─────────────────────────────────────────────────────
@@ -645,13 +802,10 @@ async def on_group_message(message: Message):
             )
             return
 
-    # ── Slow-down phrases ──────────────────────────────────────────────────
-    if SLOW_DOWN_PATTERNS.search(text):
-        new_freq = await db.increase_reply_frequency(chat_id, delta=5)
-        await message.reply(
-            f"Приношу извинения. Скорректирую алгоритм: буду отвечать раз в {new_freq} сообщений. "
-            "Надеюсь, это удовлетворит ваши социальные потребности."
-        )
+    # ── Natural language settings (highest priority after bio) ────────────
+    settings_reply = await _detect_and_apply_settings(text, chat_id, user.id)
+    if settings_reply:
+        await message.reply(settings_reply)
         return
 
     # ── Direct mention ─────────────────────────────────────────────────────
