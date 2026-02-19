@@ -219,12 +219,11 @@ async def _ask_sheldon(
     humor_override: int | None = None,
     length_override: int | None = None,
 ) -> str:
-    """Call GPT-4o with chat history + dynamic humor/length settings."""
+    """Call GPT-4o with chat history + dynamic humor/length/banned-phrases settings."""
     settings = await db.get_full_chat_settings(chat_id)
     humor = humor_override if humor_override is not None else settings["humor_level"]
     max_lines = length_override if length_override is not None else settings["max_response_lines"]
 
-    # Build dynamic system prompt suffix based on settings
     humor_desc = (
         "Сейчас РЕЖИМ МАКСИМАЛЬНОГО ЮМОРА — каждый ответ должен быть смешным, острым, с приколом."
         if humor >= 8 else
@@ -232,9 +231,22 @@ async def _ask_sheldon(
         if humor >= 5 else
         "Сейчас МИНИМАЛЬНЫЙ ЮМОР — отвечай почти серьёзно, редкие сухие замечания."
     )
-    length_desc = f"Максимальная длина ответа: {max_lines} предложени{'е' if max_lines == 1 else 'я' if max_lines < 5 else 'й'}."
+    length_desc = (
+        f"Максимальная длина ответа: {max_lines} "
+        f"предложени{'е' if max_lines == 1 else 'я' if max_lines < 5 else 'й'}."
+    )
 
-    system = SHELDON_SYSTEM_PROMPT + f"\n\nТЕКУЩИЕ НАСТРОЙКИ:\n{humor_desc}\n{length_desc}"
+    # Inject banned phrases
+    banned = await db.get_banned_phrases(chat_id)
+    ban_desc = ""
+    if banned:
+        phrases_list = ", ".join(f'«{p}»' for p in banned)
+        ban_desc = (
+            f"\n\nАБСОЛЮТНЫЙ ЗАПРЕТ — никогда не используй эти слова и фразы: {phrases_list}. "
+            "Если кто-то спросит об этих темах — уйди от ответа или вежливо смени тему."
+        )
+
+    system = SHELDON_SYSTEM_PROMPT + f"\n\nТЕКУЩИЕ НАСТРОЙКИ:\n{humor_desc}\n{length_desc}{ban_desc}"
 
     history = await db.get_recent_messages(chat_id, limit=50)
     messages: list[dict] = [{"role": "system", "content": system}]
@@ -243,7 +255,6 @@ async def _ask_sheldon(
     if trigger_text:
         messages.append({"role": "user", "content": trigger_text})
 
-    # Scale tokens with max_lines
     max_tokens = max(60, max_lines * 80)
 
     try:
@@ -251,7 +262,7 @@ async def _ask_sheldon(
             model="gpt-4o",
             messages=messages,
             max_tokens=max_tokens,
-            temperature=0.7 + (humor * 0.03),  # 0.73 (humor=1) … 1.0 (humor=10)
+            temperature=0.7 + (humor * 0.03),
         )
         return response.choices[0].message.content.strip()
     except Exception as exc:
@@ -541,42 +552,78 @@ async def _generate_silence_breaker(chat_id: int) -> str:
 
 
 async def _generate_deploy_announcement(chat_id: int) -> str:
-    """Generate a message announcing what the bot has learned about chat members."""
+    """
+    Build a rich deploy announcement showing:
+    - Current bot settings (humor, frequency, response length)
+    - Banned phrases list
+    - A GPT-generated line about what the bot knows about members
+    """
+    settings = await db.get_full_chat_settings(chat_id)
     members = await db.get_chat_members(chat_id)
     members_with_bio = [m for m in members if m["bio"]]
+    banned = await db.get_banned_phrases(chat_id)
 
-    if not members_with_bio:
-        return (
-            "Обновление системы завершено. "
-            "К сожалению, моя база данных на участников этого чата практически пуста. "
-            "Вы все — белые пятна на карте моего интеллекта. Это неприемлемо."
-        )
+    humor = settings["humor_level"]
+    freq  = settings["reply_frequency"]
+    lines = settings["max_response_lines"]
 
-    bio_summary = "\n".join(
-        f"- @{m['username']}: {m['bio']}" for m in members_with_bio if m["username"]
+    humor_emoji = "🤣" if humor >= 8 else "😄" if humor >= 5 else "😐"
+    freq_emoji  = "💬"
+    len_emoji   = "📝"
+    ban_emoji   = "🚫"
+
+    # Settings block
+    settings_block = (
+        f"{humor_emoji} *Уровень юмора:* {humor}/10\n"
+        f"{freq_emoji} *Частота ответов:* каждые {freq} сообщений\n"
+        f"{len_emoji} *Длина ответа:* до {lines} предложений"
     )
-    try:
-        resp = await openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": SHELDON_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Напиши короткое объявление в стиле Шелдона: что ты узнал об участниках чата. "
-                        f"Вот их досье:\n{bio_summary}\n\n"
-                        "Кратко, с иронией, упомяни 1-2 участников по @username. "
-                        "Можешь пошутить на основе их хобби. 2-3 предложения."
-                    ),
-                },
-            ],
-            max_tokens=200,
-            temperature=0.95,
+
+    # Banned phrases block
+    if banned:
+        ban_list = ", ".join(f"`{p}`" for p in banned)
+        ban_block = f"{ban_emoji} *Запрещённые слова:* {ban_list}"
+    else:
+        ban_block = f"{ban_emoji} *Запрещённые слова:* не заданы"
+
+    # GPT comment about known members
+    if members_with_bio:
+        bio_summary = "\n".join(
+            f"- @{m['username']}: {m['bio']}"
+            for m in members_with_bio if m["username"]
         )
-        return resp.choices[0].message.content.strip()
-    except Exception as exc:
-        logger.error("Deploy announcement error: %s", exc)
-        return "Обновление завершено. Мои алгоритмы стали острее. Берегитесь."
+        try:
+            resp = await openai_client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": SHELDON_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Напиши 1-2 предложения в стиле Шелдона о том, что ты уже знаешь "
+                            f"об участниках чата. Досье:\n{bio_summary}\n\n"
+                            "С иронией, упомяни кого-нибудь по @username. Без markdown-разметки."
+                        ),
+                    },
+                ],
+                max_tokens=120,
+                temperature=0.95,
+            )
+            gpt_line = resp.choices[0].message.content.strip()
+        except Exception:
+            gpt_line = "Моя база данных пополнилась. Детали засекречены."
+    else:
+        gpt_line = (
+            "База данных участников пуста — вы все ещё остаётесь белыми пятнами "
+            "на карте моего интеллекта. Это статистически тревожно."
+        )
+
+    return (
+        f"*⚙️ Текущие настройки:*\n"
+        f"{settings_block}\n"
+        f"{ban_block}\n\n"
+        f"🧠 _{gpt_line}_"
+    )
 
 
 # ─── Proactive scheduler ──────────────────────────────────────────────────────
@@ -606,7 +653,11 @@ async def _scheduler_loop():
             continue
         try:
             announcement = await _generate_deploy_announcement(chat_id)
-            await bot.send_message(chat_id, f"🔄 <b>Перезагрузка завершена.</b>\n\n{announcement}")
+            await bot.send_message(
+                chat_id,
+                f"🔄 *Перезагрузка завершена*\n\n{announcement}",
+                parse_mode="Markdown",
+            )
             logger.info("Deploy announcement sent to %s", chat_id)
         except Exception as exc:
             logger.warning("Deploy announcement failed for %s: %s", chat_id, exc)
@@ -966,6 +1017,140 @@ async def cmd_frequency(message: Message):
     await message.reply(
         f"Алгоритм скорректирован. Буду отвечать каждые {new_freq} сообщений. "
         "Можете расслабиться."
+    )
+
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message):
+    """
+    /ban <слово или фраза> — запретить боту использовать слово/фразу.
+    Доступно всем участникам чата.
+    """
+    user = message.from_user
+    if not user:
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply(
+            "📌 *Использование:* `/ban <слово или фраза>`\n"
+            "Пример: `/ban политика`\n\n"
+            "После этого я никогда не буду использовать это слово.",
+            parse_mode="Markdown",
+        )
+        return
+
+    phrase = parts[1].strip().lower()
+    if len(phrase) > 100:
+        await message.reply("❌ Фраза слишком длинная. Максимум 100 символов.")
+        return
+
+    await db.upsert_user(user.id, user.username)
+    await db.ensure_chat_exists(message.chat.id)
+    added = await db.add_banned_phrase(message.chat.id, phrase, user.id)
+
+    if added:
+        await message.reply(
+            f"✅ Слово/фраза `{phrase}` добавлена в стоп-лист.\n"
+            "Обещаю никогда не произносить это вслух. Занесено в протокол.",
+            parse_mode="Markdown",
+        )
+    else:
+        await message.reply(
+            f"ℹ️ Слово `{phrase}` уже есть в стоп-листе.",
+            parse_mode="Markdown",
+        )
+
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message):
+    """
+    /unban <слово или фраза> — снять запрет.
+    """
+    user = message.from_user
+    if not user:
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply(
+            "📌 *Использование:* `/unban <слово>`\n"
+            "Пример: `/unban политика`",
+            parse_mode="Markdown",
+        )
+        return
+
+    phrase = parts[1].strip().lower()
+    removed = await db.remove_banned_phrase(message.chat.id, phrase)
+
+    if removed:
+        await message.reply(
+            f"✅ Слово `{phrase}` удалено из стоп-листа. "
+            "Теперь я снова могу свободно его использовать. Ограничение снято.",
+            parse_mode="Markdown",
+        )
+    else:
+        await message.reply(
+            f"❓ Слово `{phrase}` не найдено в стоп-листе.",
+            parse_mode="Markdown",
+        )
+
+
+@dp.message(Command("banlist"))
+async def cmd_banlist(message: Message):
+    """
+    /banlist — показать все запрещённые слова и фразы.
+    """
+    banned = await db.get_banned_phrases(message.chat.id)
+
+    if not banned:
+        await message.reply(
+            "📋 *Стоп-лист пуст.*\n\n"
+            "Используй `/ban <слово>` чтобы добавить запрет.",
+            parse_mode="Markdown",
+        )
+        return
+
+    items = "\n".join(f"  • `{p}`" for p in banned)
+    await message.reply(
+        f"🚫 *Запрещённые слова и фразы* ({len(banned)} шт.):\n\n"
+        f"{items}\n\n"
+        f"_Используй_ `/unban <слово>` _чтобы снять запрет._",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: Message):
+    """
+    /settings — показать текущие настройки бота для этого чата.
+    """
+    await db.ensure_chat_exists(message.chat.id)
+    settings = await db.get_full_chat_settings(message.chat.id)
+    banned = await db.get_banned_phrases(message.chat.id)
+
+    humor = settings["humor_level"]
+    freq  = settings["reply_frequency"]
+    lines = settings["max_response_lines"]
+
+    humor_bar = "▓" * humor + "░" * (10 - humor)
+    humor_emoji = "🤣" if humor >= 8 else "😄" if humor >= 5 else "😐"
+
+    ban_text = (
+        "\n".join(f"  • `{p}`" for p in banned)
+        if banned else "  _не заданы_"
+    )
+
+    await message.reply(
+        f"⚙️ *Настройки бота для этого чата:*\n\n"
+        f"{humor_emoji} *Юмор:* `{humor_bar}` {humor}/10\n"
+        f"💬 *Частота ответов:* каждые `{freq}` сообщений\n"
+        f"📝 *Длина ответа:* до `{lines}` предложений\n\n"
+        f"🚫 *Стоп-лист:*\n{ban_text}\n\n"
+        f"_Управляй настройками прямо в чате:_\n"
+        f"`шути чаще` · `пиши реже` · `пиши короче`\n"
+        f"`/ban <слово>` · `/unban <слово>` · `/frequency <N>`",
+        parse_mode="Markdown",
     )
 
 

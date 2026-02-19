@@ -117,6 +117,17 @@ async def init_db() -> None:
             )
         """)
 
+        # Banned words/phrases per chat
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS banned_phrases (
+                id       SERIAL PRIMARY KEY,
+                chat_id  BIGINT NOT NULL,
+                phrase   TEXT   NOT NULL,
+                added_by BIGINT NOT NULL,
+                UNIQUE (chat_id, phrase)
+            )
+        """)
+
 
 # ─── Users CRUD ───────────────────────────────────────────────────────────────
 
@@ -439,3 +450,52 @@ async def is_user_ignored(chat_id: int, user_id: int) -> bool:
             WHERE  chat_id = $1 AND user_id = $2 AND ignore_until > NOW()
         """, chat_id, user_id)
         return row is not None
+
+
+# ─── Banned phrases ───────────────────────────────────────────────────────────
+
+async def add_banned_phrase(chat_id: int, phrase: str, added_by: int) -> bool:
+    """Add a phrase to the ban list. Returns True if added, False if already exists."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute("""
+                INSERT INTO banned_phrases (chat_id, phrase, added_by)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (chat_id, phrase) DO NOTHING
+            """, chat_id, phrase.lower().strip(), added_by)
+            return True
+        except Exception:
+            return False
+
+
+async def remove_banned_phrase(chat_id: int, phrase: str) -> bool:
+    """Remove a phrase from the ban list. Returns True if removed."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            DELETE FROM banned_phrases
+            WHERE chat_id = $1 AND phrase = $2
+        """, chat_id, phrase.lower().strip())
+        return result == "DELETE 1"
+
+
+async def get_banned_phrases(chat_id: int) -> list[str]:
+    """Return all banned phrases for a chat."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT phrase FROM banned_phrases WHERE chat_id = $1 ORDER BY id",
+            chat_id
+        )
+        return [r["phrase"] for r in rows]
+
+
+async def clear_banned_phrases(chat_id: int) -> int:
+    """Remove all banned phrases for a chat. Returns count deleted."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM banned_phrases WHERE chat_id = $1", chat_id
+        )
+        return int(result.split()[-1])
