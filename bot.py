@@ -36,6 +36,11 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 
+# ─── Password gate ─────────────────────────────────────────────────────────────
+BOT_PASSWORD = "рыба меч"
+# user_ids currently waiting to enter the password (in-memory, resets on restart)
+_pending_auth: set[int] = set()
+
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in .env")
 if not OPENAI_API_KEY:
@@ -76,6 +81,48 @@ SHELDON_SYSTEM_PROMPT = """Ты — Шелдон Купер в Telegram-чате
 Если пишут «пиши реже», «плохая шутка», «заткнись» — извинись занудно, пообещай «скорректировать алгоритмы».
 
 Отвечай на языке последнего сообщения. По умолчанию — русский."""
+
+# ─── Auth gate helper ─────────────────────────────────────────────────────────
+
+async def _require_auth(message: Message) -> bool:
+    """
+    Check if the sender is authorized.
+    - If authorized → return True (caller proceeds normally).
+    - If not authorized and already in pending state → check if they typed the password.
+    - If not authorized and NOT in pending state → ask for password, add to pending.
+    Returns False if the caller should abort processing the message.
+    """
+    user = message.from_user
+    if not user or user.is_bot:
+        return False
+
+    if await db.is_authorized(user.id):
+        return True
+
+    text = (message.text or "").strip()
+
+    # Check if they're entering the password
+    if text.lower() == BOT_PASSWORD.lower():
+        await db.authorize_user(user.id)
+        _pending_auth.discard(user.id)
+        await message.reply(
+            "✅ *Доступ разрешён.* Пароль принят.\n\n"
+            "Добро пожаловать. Теперь ты официально занесён в мою базу данных. "
+            "Надеюсь, ты оправдаешь затраченные вычислительные ресурсы.",
+            parse_mode="Markdown",
+        )
+        return False  # don't process original message, just confirmed auth
+
+    # Not authorized — prompt for password
+    _pending_auth.add(user.id)
+    await message.reply(
+        "🔐 *Этот бот защищён паролем.*\n\n"
+        "Для получения доступа введи пароль в следующем сообщении.\n"
+        "_Подсказка: спроси у того, кто пригласил тебя._",
+        parse_mode="Markdown",
+    )
+    return False
+
 
 # ─── Slow-down phrases ────────────────────────────────────────────────────────
 
@@ -618,10 +665,18 @@ async def _generate_deploy_announcement(chat_id: int) -> str:
             "на карте моего интеллекта. Это статистически тревожно."
         )
 
+    password_block = (
+        f"🔐 *Новое правило — пароль для новых участников:*\n"
+        f"Все новые пользователи теперь должны ввести пароль прежде чем взаимодействовать со мной.\n"
+        f"Пароль: `{BOT_PASSWORD}`\n"
+        f"_Вы уже авторизованы как действующие участники — вводить пароль не нужно._"
+    )
+
     return (
         f"*⚙️ Текущие настройки:*\n"
         f"{settings_block}\n"
         f"{ban_block}\n\n"
+        f"{password_block}\n\n"
         f"🧠 _{gpt_line}_"
     )
 
@@ -757,6 +812,9 @@ async def on_photo(message: Message):
     if not user or user.is_bot:
         return
 
+    if not await _require_auth(message):
+        return
+
     chat_id = message.chat.id
     await db.upsert_user(user.id, user.username)
     await db.ensure_chat_exists(chat_id)
@@ -853,6 +911,9 @@ async def on_voice(message: Message):
     if not user or user.is_bot:
         return
 
+    if not await _require_auth(message):
+        return
+
     chat_id = message.chat.id
     await db.upsert_user(user.id, user.username)
     await db.ensure_chat_exists(chat_id)
@@ -904,6 +965,9 @@ async def on_group_message(message: Message):
     if not user or user.is_bot:
         return
 
+    if not await _require_auth(message):
+        return
+
     text = message.text or ""
     chat_id = message.chat.id
 
@@ -952,6 +1016,9 @@ async def on_private_message(message: Message):
     """Handle private messages — always reply."""
     user = message.from_user
     if not user:
+        return
+
+    if not await _require_auth(message):
         return
 
     await db.upsert_user(user.id, user.username)
@@ -1159,6 +1226,9 @@ async def cmd_settings(message: Message):
 async def on_startup():
     logger.info("Initialising database …")
     await db.init_db()
+    # Pre-authorize all users already in the DB — they don't need to enter the password
+    count = await db.bulk_authorize_existing_users()
+    logger.info("Pre-authorized %d existing users.", count)
     me = await bot.get_me()
     logger.info("Bot started: @%s", me.username)
     # Launch proactive scheduler as background task

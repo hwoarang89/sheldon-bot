@@ -128,6 +128,14 @@ async def init_db() -> None:
             )
         """)
 
+        # Password-protected access: tracks who is authorized to use the bot
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS authorized_users (
+                user_id       BIGINT    PRIMARY KEY,
+                authorized_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """)
+
 
 # ─── Users CRUD ───────────────────────────────────────────────────────────────
 
@@ -498,4 +506,43 @@ async def clear_banned_phrases(chat_id: int) -> int:
         result = await conn.execute(
             "DELETE FROM banned_phrases WHERE chat_id = $1", chat_id
         )
+        return int(result.split()[-1])
+
+
+# ─── Authorization (password gate) ───────────────────────────────────────────
+
+async def is_authorized(user_id: int) -> bool:
+    """Return True if the user has been granted access via password."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT 1 FROM authorized_users WHERE user_id = $1", user_id
+        )
+        return row is not None
+
+
+async def authorize_user(user_id: int) -> None:
+    """Mark a user as authorized (they passed the password check)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO authorized_users (user_id, authorized_at)
+            VALUES ($1, NOW())
+            ON CONFLICT (user_id) DO NOTHING
+        """, user_id)
+
+
+async def bulk_authorize_existing_users() -> int:
+    """
+    Pre-authorize all users already in the users table.
+    Called once on startup — existing users skip the password gate.
+    Returns the number of newly authorized users.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("""
+            INSERT INTO authorized_users (user_id, authorized_at)
+            SELECT user_id, NOW() FROM users
+            ON CONFLICT (user_id) DO NOTHING
+        """)
         return int(result.split()[-1])
